@@ -109,12 +109,7 @@ func main() {
 
 	for {
 		model := promptModel(reader)
-		primaryPrompt := promptRequired(reader, "Primary prompt")
-		additionalPrompt := promptOptional(reader, "Additional description (optional)")
-		combinedPrompt := primaryPrompt
-		if additionalPrompt != "" {
-			combinedPrompt = combinedPrompt + "\n\n" + additionalPrompt
-		}
+		prompt := promptRequired(reader, "Prompt")
 
 		seconds, secondsInt := promptDuration(reader, defaultDurationSeconds, defaultDurationSeconds)
 		selectedResolution := promptResolutionSelection(reader, model.Resolutions)
@@ -200,7 +195,7 @@ func main() {
 		fmt.Println()
 		fmt.Println("Submitting generation request...")
 
-		job, err := createVideoJob(ctx, httpClient, baseURL, apiKey, combinePrompts(combinedPrompt), model.Name, seconds, size, expandedReferencePath)
+		job, err := createVideoJob(ctx, httpClient, baseURL, apiKey, combinePrompts(prompt), model.Name, seconds, size, expandedReferencePath)
 		if err != nil {
 			cancel()
 			fmt.Printf("ERROR: failed to create video job: %v\n", err)
@@ -411,6 +406,15 @@ func promptAPIKey() (string, error) {
 }
 
 func resolveEnvPath() string {
+	// First, try to find .env next to the binary
+	if execPath, err := os.Executable(); err == nil {
+		execDir := filepath.Dir(execPath)
+		envPath := filepath.Join(execDir, envFileName)
+		if _, err := os.Stat(envPath); err == nil {
+			return envPath
+		}
+	}
+	// Fallback to current working directory
 	cwd, err := os.Getwd()
 	if err != nil {
 		return envFileName
