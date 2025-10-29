@@ -7,7 +7,7 @@
 *.dll
 *.so
 *.dylib
-sora2cli
+/sora2cli
 
 # Test binary, built with `go test -c`
 *.test
