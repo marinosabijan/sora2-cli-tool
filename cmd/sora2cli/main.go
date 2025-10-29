@@ -10,6 +10,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -58,6 +59,14 @@ var modelOptions = []modelOption{
 		},
 	},
 }
+
+type jobAction int
+
+const (
+	jobActionCreate jobAction = iota
+	jobActionRemix
+	jobActionList
+)
 
 func main() {
 	fmt.Println("Sora-2 Video Generator")
@@ -108,125 +117,305 @@ func main() {
 	httpClient := &http.Client{Timeout: 60 * time.Second}
 
 	for {
-		model := promptModel(reader)
-		prompt := promptRequired(reader, "Prompt")
-
-		seconds, secondsInt := promptDuration(reader, defaultDurationSeconds, defaultDurationSeconds)
-		selectedResolution := promptResolutionSelection(reader, model.Resolutions)
-		size := selectedResolution.Value
-		referencePath := promptOptional(reader, "Path to reference image (optional)")
-
-		var expandedReferencePath string
-		if referencePath != "" {
-			var err error
-			expandedReferencePath, err = expandPath(referencePath)
-			if err != nil {
-				fmt.Printf("ERROR: %v\n", err)
-				os.Exit(1)
-			}
-			if _, err = os.Stat(expandedReferencePath); err != nil {
-				fmt.Printf("ERROR: unable to access reference file: %v\n", err)
-				os.Exit(1)
-			}
+		action := promptJobAction(reader)
+		var continueLoop bool
+		switch action {
+		case jobActionCreate:
+			continueLoop = runCreateFlow(reader, httpClient, baseURL, apiKey)
+		case jobActionRemix:
+			continueLoop = runRemixFlow(reader, httpClient, baseURL, apiKey)
+		case jobActionList:
+			continueLoop = runListFlow(reader, httpClient, baseURL, apiKey)
+		default:
+			continue
 		}
-
-		destinationDir := promptOptional(reader, "Destination directory for the video (leave blank to use current directory)")
-		destinationDir = strings.TrimSpace(destinationDir)
-
-		var expandedDest string
-		var err error
-		if destinationDir == "" {
-			expandedDest, err = os.Getwd()
-			if err != nil {
-				fmt.Printf("ERROR: unable to determine current directory: %v\n", err)
-				os.Exit(1)
-			}
-		} else {
-			expandedDest, err = expandPath(destinationDir)
-			if err != nil {
-				fmt.Printf("ERROR: %v\n", err)
-				os.Exit(1)
-			}
-			if err = os.MkdirAll(expandedDest, 0o755); err != nil {
-				fmt.Printf("ERROR: unable to create destination directory: %v\n", err)
-				os.Exit(1)
-			}
-		}
-
-		outputName := promptRequired(reader, "Output video filename (without extension)")
-		outputName = sanitizeFilename(outputName)
-		if outputName == "" {
-			fmt.Println("ERROR: output filename is empty after sanitization.")
-			os.Exit(1)
-		}
-		if !strings.HasSuffix(strings.ToLower(outputName), ".mp4") {
-			outputName += ".mp4"
-		}
-		outputPath := filepath.Join(expandedDest, outputName)
-
-		if _, err = os.Stat(outputPath); err == nil {
-			overwrite := promptConfirm(reader, fmt.Sprintf("%s already exists. Overwrite?", outputPath))
-			if !overwrite {
-				fmt.Println("Aborted by user.")
-				return
-			}
-		}
-
-		fmt.Println()
-		fmt.Println("Configuration summary:")
-		fmt.Printf("  Model: %s\n", model.Name)
-		fmt.Printf("  Duration: %d seconds\n", secondsInt)
-		fmt.Printf("  Resolution: %s\n", selectedResolution.Label)
-		if expandedReferencePath != "" {
-			fmt.Printf("  Reference image: %s\n", expandedReferencePath)
-		}
-		fmt.Printf("  Save to: %s\n", outputPath)
-		estimatedCost := model.RatePerSecond * float64(secondsInt)
-		fmt.Printf("  Estimated cost: $%.2f (%ds @ $%.2f/s)\n", estimatedCost, secondsInt, model.RatePerSecond)
-		fmt.Println()
-
-		if !promptConfirm(reader, "Proceed with generation?") {
-			fmt.Println("Aborted by user.")
-			return
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), maxWaitDuration)
-		fmt.Println()
-		fmt.Println("Submitting generation request...")
-
-		job, err := createVideoJob(ctx, httpClient, baseURL, apiKey, combinePrompts(prompt), model.Name, seconds, size, expandedReferencePath)
-		if err != nil {
-			cancel()
-			fmt.Printf("ERROR: failed to create video job: %v\n", err)
-			os.Exit(1)
-		}
-
-		fmt.Printf("Job queued with ID: %s\n", job.ID)
-
-		job, err = waitForJobCompletion(ctx, httpClient, baseURL, apiKey, job.ID)
-		if err != nil {
-			cancel()
-			fmt.Printf("ERROR: generation failed: %v\n", err)
-			os.Exit(1)
-		}
-
-		fmt.Println("Job completed. Downloading video...")
-
-		if err = downloadVideoContent(ctx, httpClient, baseURL, apiKey, job.ID, outputPath); err != nil {
-			cancel()
-			fmt.Printf("ERROR: failed to download video: %v\n", err)
-			os.Exit(1)
-		}
-		cancel()
-
-		fmt.Printf("Video saved to %s\n", outputPath)
-
-		if !promptConfirm(reader, "Generate another video?") {
-			fmt.Println("Done.")
+		if !continueLoop {
 			return
 		}
 		fmt.Println()
 	}
+}
+
+func promptJobAction(reader *bufio.Reader) jobAction {
+	for {
+		fmt.Println("Select action:")
+		fmt.Println("  1) Create a new video")
+		fmt.Println("  2) Remix an existing video")
+		fmt.Println("  3) List recent videos")
+		fmt.Print("Enter choice (1-3): ")
+		input, err := reader.ReadString('\n')
+		if err != nil {
+			fmt.Printf("Input error: %v\n", err)
+			continue
+		}
+		input = strings.TrimSpace(input)
+		switch strings.ToLower(input) {
+		case "", "1", "create", "new", "c":
+			return jobActionCreate
+		case "2", "remix", "r":
+			return jobActionRemix
+		case "3", "list", "l":
+			return jobActionList
+		default:
+			fmt.Println("Invalid selection, please try again.")
+		}
+	}
+}
+
+func runCreateFlow(reader *bufio.Reader, httpClient *http.Client, baseURL, apiKey string) bool {
+	model := promptModel(reader)
+	prompt := promptRequired(reader, "Prompt")
+
+	seconds, secondsInt := promptDuration(reader, defaultDurationSeconds)
+	selectedResolution := promptResolutionSelection(reader, model.Resolutions)
+	size := selectedResolution.Value
+	referencePath := promptOptional(reader, "Path to reference image (optional)")
+
+	var expandedReferencePath string
+	if referencePath != "" {
+		var err error
+		expandedReferencePath, err = expandPath(referencePath)
+		if err != nil {
+			fmt.Printf("ERROR: %v\n", err)
+			os.Exit(1)
+		}
+		if _, err = os.Stat(expandedReferencePath); err != nil {
+			fmt.Printf("ERROR: unable to access reference file: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	expandedDest := promptDestinationDirectory(reader)
+
+	fmt.Println()
+	fmt.Println("Configuration summary:")
+	fmt.Printf("  Action: Create new video\n")
+	fmt.Printf("  Model: %s\n", model.Name)
+	fmt.Printf("  Duration: %d seconds\n", secondsInt)
+	fmt.Printf("  Resolution: %s\n", selectedResolution.Label)
+	if expandedReferencePath != "" {
+		fmt.Printf("  Reference image: %s\n", expandedReferencePath)
+	}
+	fmt.Printf("  Destination: %s (filename will match job ID)\n", expandedDest)
+	estimatedCost := model.RatePerSecond * float64(secondsInt)
+	fmt.Printf("  Estimated cost: $%.2f (%ds @ $%.2f/s)\n", estimatedCost, secondsInt, model.RatePerSecond)
+	fmt.Println()
+
+	if !promptConfirm(reader, "Proceed with generation?") {
+		fmt.Println("Aborted by user.")
+		return false
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), maxWaitDuration)
+	fmt.Println()
+	fmt.Println("Submitting generation request...")
+
+	job, err := createVideoJob(ctx, httpClient, baseURL, apiKey, combinePrompts(prompt), model.Name, seconds, size, expandedReferencePath)
+	if err != nil {
+		cancel()
+		fmt.Printf("ERROR: failed to create video job: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Job queued with ID: %s\n", job.ID)
+	outputPath := filepath.Join(expandedDest, job.ID+".mp4")
+
+	job, err = waitForJobCompletion(ctx, httpClient, baseURL, apiKey, job.ID)
+	if err != nil {
+		cancel()
+		fmt.Printf("ERROR: generation failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("Job completed. Downloading video...")
+
+	if err = downloadVideoContent(ctx, httpClient, baseURL, apiKey, job.ID, outputPath); err != nil {
+		cancel()
+		fmt.Printf("ERROR: failed to download video: %v\n", err)
+		os.Exit(1)
+	}
+	cancel()
+
+	fmt.Printf("Video saved to %s\n", outputPath)
+
+	if !promptConfirm(reader, "Generate another video?") {
+		fmt.Println("Done.")
+		return false
+	}
+	return true
+}
+
+func runRemixFlow(reader *bufio.Reader, httpClient *http.Client, baseURL, apiKey string) bool {
+	originalVideoID := promptRequired(reader, "Existing video ID to remix")
+	remixPrompt := promptRequired(reader, "Remix prompt (describe the change)")
+	expandedDest := promptDestinationDirectory(reader)
+
+	fmt.Println()
+	fmt.Println("Configuration summary:")
+	fmt.Printf("  Action: Remix existing video\n")
+	fmt.Printf("  Source video ID: %s\n", originalVideoID)
+	fmt.Printf("  Remix prompt: %s\n", remixPrompt)
+	fmt.Printf("  Destination: %s (filename will match job ID)\n", expandedDest)
+	fmt.Println()
+
+	if !promptConfirm(reader, "Proceed with remix generation?") {
+		fmt.Println("Aborted by user.")
+		return false
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), maxWaitDuration)
+	fmt.Println()
+	fmt.Println("Submitting remix request...")
+
+	job, err := createRemixJob(ctx, httpClient, baseURL, apiKey, originalVideoID, combinePrompts(remixPrompt))
+	if err != nil {
+		cancel()
+		fmt.Printf("ERROR: failed to create remix job: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Remix job queued with ID: %s\n", job.ID)
+	outputPath := filepath.Join(expandedDest, job.ID+".mp4")
+
+	job, err = waitForJobCompletion(ctx, httpClient, baseURL, apiKey, job.ID)
+	if err != nil {
+		cancel()
+		fmt.Printf("ERROR: remix failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("Remix completed. Downloading video...")
+
+	if err = downloadVideoContent(ctx, httpClient, baseURL, apiKey, job.ID, outputPath); err != nil {
+		cancel()
+		fmt.Printf("ERROR: failed to download remix video: %v\n", err)
+		os.Exit(1)
+	}
+	cancel()
+
+	fmt.Printf("Remixed video saved to %s\n", outputPath)
+
+	if !promptConfirm(reader, "Perform another action?") {
+		fmt.Println("Done.")
+		return false
+	}
+	return true
+}
+
+func runListFlow(reader *bufio.Reader, httpClient *http.Client, baseURL, apiKey string) bool {
+	limit := 20
+	for {
+		input := promptOptional(reader, "Number of videos to list (1-100, leave blank for 20)")
+		input = strings.TrimSpace(input)
+		if input == "" {
+			break
+		}
+		value, err := strconv.Atoi(input)
+		if err != nil || value <= 0 || value > 100 {
+			fmt.Println("Please enter a whole number between 1 and 100, or leave blank for 20.")
+			continue
+		}
+		limit = value
+		break
+	}
+
+	order := "desc"
+	for {
+		input := promptOptional(reader, "Sort order (asc/desc, leave blank for desc)")
+		input = strings.TrimSpace(strings.ToLower(input))
+		if input == "" {
+			break
+		}
+		if input == "asc" || input == "desc" {
+			order = input
+			break
+		}
+		fmt.Println("Please enter 'asc', 'desc', or leave blank.")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	fmt.Println()
+	fmt.Println("Fetching videos...")
+	list, err := listVideoJobs(ctx, httpClient, baseURL, apiKey, limit, "", order)
+	if err != nil {
+		fmt.Printf("ERROR: failed to list videos: %v\n", err)
+		return promptConfirm(reader, "Try another action?")
+	}
+
+	if len(list.Data) == 0 {
+		fmt.Println("No videos found.")
+	} else {
+		fmt.Println()
+		fmt.Printf("Showing %d video(s):\n", len(list.Data))
+		fmt.Println("----------------------------------------")
+		for _, job := range list.Data {
+			created := "(unknown)"
+			if job.CreatedAt > 0 {
+				created = time.Unix(job.CreatedAt, 0).Format(time.RFC3339)
+			}
+			fmt.Printf("ID: %s\n", job.ID)
+			fmt.Printf("  Status: %s\n", job.Status)
+			if job.Model != "" {
+				fmt.Printf("  Model: %s\n", job.Model)
+			}
+			if job.Seconds != "" {
+				fmt.Printf("  Duration: %s seconds\n", job.Seconds)
+			}
+			if job.Size != "" {
+				fmt.Printf("  Size: %s\n", job.Size)
+			}
+			fmt.Printf("  Created: %s\n", created)
+			progress := normalizeProgress(job.Progress)
+			if progress > 0 && progress <= 100 {
+				fmt.Printf("  Progress: %.0f%%\n", progress)
+			}
+			fmt.Println("----------------------------------------")
+		}
+		nextCursor := list.Next
+		if nextCursor == "" {
+			nextCursor = list.NextCursor
+		}
+		if list.HasMore || nextCursor != "" {
+			fmt.Println("More videos available. Use the 'after' cursor to continue pagination.")
+			if nextCursor != "" {
+				fmt.Printf("Next cursor: %s\n", nextCursor)
+			}
+		}
+	}
+
+	if !promptConfirm(reader, "Perform another action?") {
+		fmt.Println("Done.")
+		return false
+	}
+	return true
+}
+
+func promptDestinationDirectory(reader *bufio.Reader) string {
+	destinationDir := promptOptional(reader, "Destination directory for the video (leave blank to use current directory)")
+	destinationDir = strings.TrimSpace(destinationDir)
+
+	var expandedDest string
+	var err error
+	if destinationDir == "" {
+		expandedDest, err = os.Getwd()
+		if err != nil {
+			fmt.Printf("ERROR: unable to determine current directory: %v\n", err)
+			os.Exit(1)
+		}
+		return expandedDest
+	}
+	expandedDest, err = expandPath(destinationDir)
+	if err != nil {
+		fmt.Printf("ERROR: %v\n", err)
+		os.Exit(1)
+	}
+	if err = os.MkdirAll(expandedDest, 0o755); err != nil {
+		fmt.Printf("ERROR: unable to create destination directory: %v\n", err)
+		os.Exit(1)
+	}
+	return expandedDest
 }
 
 func promptModel(reader *bufio.Reader) modelOption {
@@ -259,10 +448,97 @@ func promptModel(reader *bufio.Reader) modelOption {
 	}
 }
 
+func readLongLine(reader *bufio.Reader) (string, error) {
+	// Check if stdin is a terminal
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		// Not a terminal, use normal read
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			return "", err
+		}
+		if len(line) > 0 && line[len(line)-1] == '\n' {
+			line = line[:len(line)-1]
+		}
+		if len(line) > 0 && line[len(line)-1] == '\r' {
+			line = line[:len(line)-1]
+		}
+		return string(line), nil
+	}
+
+	// For terminal, temporarily disable canonical mode to allow long input
+	// Save current terminal state
+	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
+	if err != nil {
+		// If raw mode fails, fall back to normal read
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			return "", err
+		}
+		if len(line) > 0 && line[len(line)-1] == '\n' {
+			line = line[:len(line)-1]
+		}
+		if len(line) > 0 && line[len(line)-1] == '\r' {
+			line = line[:len(line)-1]
+		}
+		return string(line), nil
+	}
+	defer term.Restore(int(os.Stdin.Fd()), oldState) // Restore terminal state
+
+	// Read in raw mode - this bypasses terminal line buffer limits
+	var result []byte
+	buf := make([]byte, 8192) // Read in 8KB chunks
+	for {
+		n, err := os.Stdin.Read(buf)
+		if n > 0 {
+			// Process each character
+			for i := 0; i < n; i++ {
+				b := buf[i]
+				// Handle Enter/Return (both \n and \r)
+				if b == '\n' || b == '\r' {
+					fmt.Print("\r\n")
+					return string(result), nil
+				}
+				// Handle Ctrl+C
+				if b == 3 { // ETX
+					fmt.Print("\n")
+					return "", errors.New("interrupted")
+				}
+				// Handle backspace/delete
+				if b == 127 || b == 8 { // DEL or BS
+					if len(result) > 0 {
+						result = result[:len(result)-1]
+						fmt.Print("\b \b") // Erase character
+					}
+					continue
+				}
+				// Echo printable characters
+				if b >= 32 || b == '\t' {
+					fmt.Print(string(b))
+					result = append(result, b)
+				}
+			}
+		}
+		if err == io.EOF {
+			if len(result) > 0 {
+				fmt.Print("\n")
+				return string(result), nil
+			}
+			return "", err
+		}
+		if err != nil {
+			if len(result) > 0 {
+				fmt.Print("\n")
+				return string(result), nil
+			}
+			return "", err
+		}
+	}
+}
+
 func promptRequired(reader *bufio.Reader, label string) string {
 	for {
 		fmt.Printf("%s: ", label)
-		input, err := reader.ReadString('\n')
+		input, err := readLongLine(reader)
 		if err != nil {
 			fmt.Printf("Input error: %v\n", err)
 			continue
@@ -286,21 +562,7 @@ func promptOptional(reader *bufio.Reader, label string) string {
 	return strings.TrimSpace(input)
 }
 
-func promptDefault(reader *bufio.Reader, label, defaultValue string) string {
-	fmt.Printf("%s [%s]: ", label, defaultValue)
-	input, err := reader.ReadString('\n')
-	if err != nil {
-		fmt.Printf("Input error: %v\n", err)
-		return defaultValue
-	}
-	value := strings.TrimSpace(input)
-	if value == "" {
-		return defaultValue
-	}
-	return value
-}
-
-func promptDuration(reader *bufio.Reader, defaultSeconds, minSeconds int) (string, int) {
+func promptDuration(reader *bufio.Reader, defaultSeconds int) (string, int) {
 	allowedSeconds := []int{4, 8, 12}
 	defaultIdx := 0
 	for i, sec := range allowedSeconds {
@@ -406,13 +668,6 @@ func expandPath(path string) (string, error) {
 		return filepath.Join(home, strings.TrimPrefix(path, "~")), nil
 	}
 	return path, nil
-}
-
-func sanitizeFilename(name string) string {
-	name = strings.TrimSpace(name)
-	name = strings.ReplaceAll(name, string(os.PathSeparator), "_")
-	name = strings.ReplaceAll(name, "..", "_")
-	return name
 }
 
 func promptAPIKey() (string, error) {
@@ -620,6 +875,99 @@ func createVideoJob(ctx context.Context, client *http.Client, baseURL, apiKey, p
 	return &job, nil
 }
 
+func createRemixJob(ctx context.Context, client *http.Client, baseURL, apiKey, videoID, prompt string) (*videoJob, error) {
+	payload := map[string]string{"prompt": prompt}
+	body := &bytes.Buffer{}
+	if err := json.NewEncoder(body).Encode(payload); err != nil {
+		return nil, err
+	}
+
+	url := fmt.Sprintf("%s%s/%s/remix", baseURL, videosPath, videoID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	if org := strings.TrimSpace(os.Getenv("OPENAI_ORG_ID")); org != "" {
+		req.Header.Set("OpenAI-Organization", org)
+	}
+	if project := strings.TrimSpace(os.Getenv("OPENAI_PROJECT_ID")); project != "" {
+		req.Header.Set("OpenAI-Project", project)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		apiErr := readAPIError(resp.Body)
+		return nil, fmt.Errorf("API error (%d): %s", resp.StatusCode, apiErr)
+	}
+
+	var job videoJob
+	if err := json.NewDecoder(resp.Body).Decode(&job); err != nil {
+		return nil, err
+	}
+	if job.ID == "" {
+		return nil, errors.New("response missing job ID")
+	}
+	return &job, nil
+}
+
+func listVideoJobs(ctx context.Context, client *http.Client, baseURL, apiKey string, limit int, after, order string) (*videoListResponse, error) {
+	endpoint, err := url.Parse(baseURL + videosPath)
+	if err != nil {
+		return nil, err
+	}
+	query := endpoint.Query()
+	if limit > 0 {
+		query.Set("limit", strconv.Itoa(limit))
+	}
+	if after != "" {
+		query.Set("after", after)
+	}
+	if order != "" {
+		query.Set("order", order)
+	}
+	endpoint.RawQuery = query.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Accept", "application/json")
+
+	if org := strings.TrimSpace(os.Getenv("OPENAI_ORG_ID")); org != "" {
+		req.Header.Set("OpenAI-Organization", org)
+	}
+	if project := strings.TrimSpace(os.Getenv("OPENAI_PROJECT_ID")); project != "" {
+		req.Header.Set("OpenAI-Project", project)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		apiErr := readAPIError(resp.Body)
+		return nil, fmt.Errorf("API error (%d): %s", resp.StatusCode, apiErr)
+	}
+
+	var list videoListResponse
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		return nil, err
+	}
+	return &list, nil
+}
+
 func waitForJobCompletion(ctx context.Context, client *http.Client, baseURL, apiKey, jobID string) (*videoJob, error) {
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
@@ -774,4 +1122,12 @@ type videoJobError struct {
 	Message string `json:"message"`
 	Type    string `json:"type"`
 	Code    string `json:"code"`
+}
+
+type videoListResponse struct {
+	Object     string     `json:"object"`
+	Data       []videoJob `json:"data"`
+	HasMore    bool       `json:"has_more"`
+	Next       string     `json:"next"`
+	NextCursor string     `json:"next_cursor"`
 }
