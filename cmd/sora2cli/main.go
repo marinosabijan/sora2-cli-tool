@@ -183,7 +183,6 @@ func main() {
 		fmt.Printf("  Save to: %s\n", outputPath)
 		estimatedCost := model.RatePerSecond * float64(secondsInt)
 		fmt.Printf("  Estimated cost: $%.2f (%ds @ $%.2f/s)\n", estimatedCost, secondsInt, model.RatePerSecond)
-		fmt.Printf("  Minimum duration: %d seconds\n", defaultDurationSeconds)
 		fmt.Println()
 
 		if !promptConfirm(reader, "Proceed with generation?") {
@@ -302,16 +301,46 @@ func promptDefault(reader *bufio.Reader, label, defaultValue string) string {
 }
 
 func promptDuration(reader *bufio.Reader, defaultSeconds, minSeconds int) (string, int) {
-	defaultValue := strconv.Itoa(defaultSeconds)
-	fmt.Printf("Minimum duration is %d seconds.\n", minSeconds)
+	allowedSeconds := []int{4, 8, 12}
+	defaultIdx := 0
+	for i, sec := range allowedSeconds {
+		if sec == defaultSeconds {
+			defaultIdx = i
+			break
+		}
+	}
 	for {
-		value := promptDefault(reader, "Clip duration in seconds", defaultValue)
-		seconds, err := strconv.Atoi(value)
-		if err != nil || seconds < minSeconds {
-			fmt.Printf("Please enter an integer greater than or equal to %d.\n", minSeconds)
+		fmt.Println("Select clip duration:")
+		for i, sec := range allowedSeconds {
+			marker := ""
+			if i == defaultIdx {
+				marker = " (default)"
+			}
+			fmt.Printf("  %d) %d seconds%s\n", i+1, sec, marker)
+		}
+		fmt.Printf("Enter choice (1-%d): ", len(allowedSeconds))
+		input, err := reader.ReadString('\n')
+		if err != nil {
+			fmt.Printf("Input error: %v\n", err)
 			continue
 		}
-		return strconv.Itoa(seconds), seconds
+		input = strings.TrimSpace(input)
+		if input == "" {
+			seconds := allowedSeconds[defaultIdx]
+			return strconv.Itoa(seconds), seconds
+		}
+		if idx, convErr := strconv.Atoi(input); convErr == nil {
+			if idx >= 1 && idx <= len(allowedSeconds) {
+				seconds := allowedSeconds[idx-1]
+				return strconv.Itoa(seconds), seconds
+			}
+		}
+		for _, sec := range allowedSeconds {
+			if input == strconv.Itoa(sec) {
+				return strconv.Itoa(sec), sec
+			}
+		}
+		fmt.Println("Invalid selection, please try again.")
 	}
 }
 
