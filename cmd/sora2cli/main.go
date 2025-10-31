@@ -8,14 +8,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/term"
 )
@@ -59,6 +62,24 @@ var modelOptions = []modelOption{
 		},
 	},
 }
+
+var (
+	supportedReferenceMIMEs = []string{
+		"image/jpeg",
+		"image/png",
+		"image/webp",
+		"video/mp4",
+	}
+	referenceMIMECandidates = map[string]string{
+		"image/jpeg":  "image/jpeg",
+		"image/jpg":   "image/jpeg",
+		"image/pjpeg": "image/jpeg",
+		"image/png":   "image/png",
+		"image/x-png": "image/png",
+		"image/webp":  "image/webp",
+		"video/mp4":   "video/mp4",
+	}
+)
 
 type jobAction int
 
@@ -486,15 +507,20 @@ func readLongLine(reader *bufio.Reader) (string, error) {
 
 	// Read in raw mode - this bypasses terminal line buffer limits
 	var result []byte
+	var pending []byte
 	buf := make([]byte, 8192) // Read in 8KB chunks
 	for {
-		n, err := os.Stdin.Read(buf)
+		n, readErr := os.Stdin.Read(buf)
 		if n > 0 {
-			// Process each character
-			for i := 0; i < n; i++ {
-				b := buf[i]
+			pending = append(pending, buf[:n]...)
+			for len(pending) > 0 {
+				b := pending[0]
 				// Handle Enter/Return (both \n and \r)
-				if b == '\n' || b == '\r' {
+				if b == '\n' {
+					fmt.Print("\r\n")
+					return string(result), nil
+				}
+				if b == '\r' {
 					fmt.Print("\r\n")
 					return string(result), nil
 				}
@@ -505,34 +531,60 @@ func readLongLine(reader *bufio.Reader) (string, error) {
 				}
 				// Handle backspace/delete
 				if b == 127 || b == 8 { // DEL or BS
+					pending = pending[1:]
 					if len(result) > 0 {
-						result = result[:len(result)-1]
-						fmt.Print("\b \b") // Erase character
+						result = truncateLastRune(result)
+						fmt.Print("\b \b")
 					}
 					continue
 				}
-				// Echo printable characters
-				if b >= 32 || b == '\t' {
-					fmt.Print(string(b))
-					result = append(result, b)
+				// Ignore other control characters except tab
+				if b < 32 && b != '\t' {
+					pending = pending[1:]
+					continue
 				}
+				if !utf8.FullRune(pending) {
+					break
+				}
+				r, size := utf8.DecodeRune(pending)
+				chunk := pending[:size]
+				pending = pending[size:]
+				if r == utf8.RuneError && size == 1 {
+					continue
+				}
+				fmt.Print(string(chunk))
+				result = append(result, chunk...)
 			}
 		}
-		if err == io.EOF {
+		if readErr == io.EOF {
 			if len(result) > 0 {
 				fmt.Print("\n")
 				return string(result), nil
 			}
-			return "", err
+			return "", readErr
 		}
-		if err != nil {
+		if readErr != nil {
 			if len(result) > 0 {
 				fmt.Print("\n")
 				return string(result), nil
 			}
-			return "", err
+			return "", readErr
 		}
 	}
+}
+
+func truncateLastRune(b []byte) []byte {
+	if len(b) == 0 {
+		return b
+	}
+	i := len(b) - 1
+	for i >= 0 && !utf8.RuneStart(b[i]) {
+		i--
+	}
+	if i < 0 {
+		return b[:0]
+	}
+	return b[:i]
 }
 
 func promptRequired(reader *bufio.Reader, label string) string {
@@ -826,7 +878,19 @@ func createVideoJob(ctx context.Context, client *http.Client, baseURL, apiKey, p
 			return nil, fmt.Errorf("open reference: %w", err)
 		}
 		defer file.Close()
-		part, err := writer.CreateFormFile("input_reference", filepath.Base(referencePath))
+
+		mimeType, err := detectReferenceMIME(file)
+		if err != nil {
+			return nil, fmt.Errorf("reference file: %w", err)
+		}
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			return nil, fmt.Errorf("rewind reference: %w", err)
+		}
+
+		header := make(textproto.MIMEHeader)
+		header.Set("Content-Disposition", fmt.Sprintf("form-data; name=%q; filename=%q", "input_reference", filepath.Base(referencePath)))
+		header.Set("Content-Type", mimeType)
+		part, err := writer.CreatePart(header)
 		if err != nil {
 			return nil, err
 		}
@@ -873,6 +937,46 @@ func createVideoJob(ctx context.Context, client *http.Client, baseURL, apiKey, p
 		return nil, errors.New("response missing job ID")
 	}
 	return &job, nil
+}
+
+func detectReferenceMIME(file *os.File) (string, error) {
+	buf := make([]byte, 512)
+	n, err := file.Read(buf)
+	if err != nil && err != io.EOF {
+		return "", fmt.Errorf("read reference header: %w", err)
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return "", fmt.Errorf("rewind reference header: %w", err)
+	}
+
+	if n > 0 {
+		if mimeType, ok := canonicalizeReferenceMIME(http.DetectContentType(buf[:n])); ok {
+			return mimeType, nil
+		}
+	}
+
+	ext := strings.ToLower(filepath.Ext(file.Name()))
+	if ext != "" {
+		if mimeType := mime.TypeByExtension(ext); mimeType != "" {
+			if canonical, ok := canonicalizeReferenceMIME(mimeType); ok {
+				return canonical, nil
+			}
+		}
+	}
+
+	return "", fmt.Errorf("unsupported reference file type; supported types: %s", strings.Join(supportedReferenceMIMEs, ", "))
+}
+
+func canonicalizeReferenceMIME(mimeType string) (string, bool) {
+	mimeType = strings.TrimSpace(strings.ToLower(mimeType))
+	if mimeType == "" {
+		return "", false
+	}
+	if idx := strings.Index(mimeType, ";"); idx != -1 {
+		mimeType = mimeType[:idx]
+	}
+	canonical, ok := referenceMIMECandidates[mimeType]
+	return canonical, ok
 }
 
 func createRemixJob(ctx context.Context, client *http.Client, baseURL, apiKey, videoID, prompt string) (*videoJob, error) {
